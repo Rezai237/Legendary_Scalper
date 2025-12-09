@@ -155,7 +155,7 @@ VOLUME_LOOKBACK = 20                  # Look at last 20 candles for average
 # =============================================================================
 # TREND ALIGNMENT SETTINGS
 # =============================================================================
-TREND_ALIGNMENT_ENABLED = True        # Require multiple TF alignment
+TREND_ALIGNMENT_ENABLED = True        # Require multiple TF alignments
 MIN_TF_ALIGNMENT = 4                  # At least 4 out of 5 TF must agree
 
 # =============================================================================
@@ -190,25 +190,22 @@ MARTINGALE_HARD_STOP_USD = 55   # Emergency close at -$55 loss (dollar based)
 MARTINGALE_HALF_CLOSE_PERCENT = 2  # Close half when within 2% of average
 MARTINGALE_TP_PERCENT = 1.5     # Take profit at 1.5% profit
 
-# Martingale Steps: [margin per step in USDT] - 15 Steps
+# Martingale Steps: [margin per step in USDT] - 9 Steps (for $400 account)
 MARTINGALE_STEPS = [
-    3, 3, 5, 5, 7,      # Steps 1-5 (Early probing)
-    10, 15, 20, 25, 30, # Steps 6-10 (Building position)
-    40, 50, 60, 80, 100 # Steps 11-15 (Heavy recovery)
+    4, 4, 6, 6, 8,       # Steps 1-5 (Early probing)
+    11, 16, 21, 26       # Steps 6-9 (Building position)
 ]
 
 # Distance % from average before next step allowed
 MARTINGALE_STEP_DISTANCES = [
     0, 3, 5, 8, 12,     # Steps 1-5
-    16, 20, 25, 30, 35, # Steps 6-10
-    40, 45, 50, 60, 70  # Steps 11-15
+    16, 20, 25, 30      # Steps 6-9
 ]
 
 # Minimum wait time (minutes) between steps
 MARTINGALE_STEP_WAIT_TIMES = [
     0, 2, 2, 3, 3,      # Steps 1-5 (Fast)
-    5, 5, 10, 10, 15,   # Steps 6-10 (Medium)
-    20, 30, 45, 60, 90  # Steps 11-15 (Slow/Patient)
+    5, 5, 10, 10        # Steps 6-9 (Medium)
 ]
 
 # Dynamic Blacklist Settings (prevent repeated losses on same token)
