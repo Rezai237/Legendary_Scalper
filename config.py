@@ -115,7 +115,7 @@ LEVERAGE = 10                   # Futures leverage (10x for Martingale)
 MARGIN_TYPE = "CROSSED"         # CROSSED or ISOLATED
 
 # Capital Management
-TOTAL_CAPITAL_USDT = 4000       # Fixed total capital to use (4000 USDT)
+TOTAL_CAPITAL_USDT = 400       # Fixed total capital to use (4000 USDT)
 USE_FIXED_CAPITAL = True        # Use fixed capital instead of account balance
 
 # Position Sizing (Initial Margin based)
