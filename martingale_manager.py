@@ -5,7 +5,7 @@ Martingale Manager - Handle step-based counter-trend positions
 import time
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from logger import logger
 import config
 
@@ -28,7 +28,110 @@ class MartingalePosition:
     # Trailing TP fields
     trailing_tp_active: bool = False  # True when in trailing mode
     max_profit_usd: float = 0  # Maximum profit reached (for trailing)
+
+
+@dataclass
+class StopLossRecord:
+    """Track a single stop loss event"""
+    symbol: str
+    timestamp: datetime
+    reason: str
+    loss_usd: float
+
+
+class DynamicBlacklist:
+    """
+    Track stop losses and auto-blacklist tokens with repeated losses.
     
+    Rule: If a token has N stop losses within X hours, blacklist it for Y hours.
+    """
+    def __init__(self):
+        self.stop_loss_history: List[StopLossRecord] = []
+        self.blacklisted: Dict[str, datetime] = {}  # symbol -> blacklist_until
+        
+        # Load settings from config
+        self.enabled = getattr(config, 'DYNAMIC_BLACKLIST_ENABLED', True)
+        self.max_stop_losses = getattr(config, 'DYNAMIC_BLACKLIST_STOP_LOSSES', 2)
+        self.window_hours = getattr(config, 'DYNAMIC_BLACKLIST_WINDOW_HOURS', 2)
+        self.blacklist_hours = getattr(config, 'DYNAMIC_BLACKLIST_DURATION_HOURS', 6)
+        
+        logger.info(f"🚫 Dynamic Blacklist: {self.max_stop_losses} SLs in {self.window_hours}h → {self.blacklist_hours}h ban")
+    
+    def record_stop_loss(self, symbol: str, reason: str, loss_usd: float):
+        """Record a stop loss event and check if token should be blacklisted"""
+        if not self.enabled:
+            return
+        
+        record = StopLossRecord(
+            symbol=symbol,
+            timestamp=datetime.now(),
+            reason=reason,
+            loss_usd=loss_usd
+        )
+        self.stop_loss_history.append(record)
+        
+        # Check if we should blacklist this token
+        self._check_and_blacklist(symbol)
+        
+        # Clean old history (older than 24h)
+        self._cleanup_old_records()
+    
+    def _check_and_blacklist(self, symbol: str):
+        """Check if token has too many stop losses in window"""
+        cutoff = datetime.now() - timedelta(hours=self.window_hours)
+        
+        recent_losses = [
+            r for r in self.stop_loss_history
+            if r.symbol == symbol and r.timestamp >= cutoff
+        ]
+        
+        if len(recent_losses) >= self.max_stop_losses:
+            blacklist_until = datetime.now() + timedelta(hours=self.blacklist_hours)
+            self.blacklisted[symbol] = blacklist_until
+            
+            total_loss = sum(r.loss_usd for r in recent_losses)
+            logger.warning(f"🚫 BLACKLISTED: {symbol} for {self.blacklist_hours}h")
+            logger.warning(f"   Reason: {len(recent_losses)} stop losses in {self.window_hours}h")
+            logger.warning(f"   Total loss: ${abs(total_loss):.2f}")
+    
+    def is_blacklisted(self, symbol: str) -> bool:
+        """Check if a token is currently blacklisted"""
+        if not self.enabled:
+            return False
+        
+        if symbol not in self.blacklisted:
+            return False
+        
+        # Check if blacklist expired
+        if datetime.now() >= self.blacklisted[symbol]:
+            del self.blacklisted[symbol]
+            logger.info(f"✅ {symbol} removed from dynamic blacklist (expired)")
+            return False
+        
+        return True
+    
+    def get_blacklist_status(self, symbol: str) -> Dict:
+        """Get blacklist status for a symbol"""
+        if symbol not in self.blacklisted:
+            return {'blacklisted': False}
+        
+        expires = self.blacklisted[symbol]
+        remaining = (expires - datetime.now()).total_seconds() / 3600
+        
+        return {
+            'blacklisted': True,
+            'expires': expires,
+            'remaining_hours': max(0, remaining)
+        }
+    
+    def _cleanup_old_records(self):
+        """Remove records older than 24 hours"""
+        cutoff = datetime.now() - timedelta(hours=24)
+        self.stop_loss_history = [
+            r for r in self.stop_loss_history
+            if r.timestamp >= cutoff
+        ]
+
 
 class MartingaleManager:
     """
@@ -67,6 +170,7 @@ class MartingaleManager:
         self.client = client
         self.executor = executor
         self.positions: Dict[str, MartingalePosition] = {}
+        self.dynamic_blacklist = DynamicBlacklist()
         
         # Load settings from config if available
         self.max_positions = getattr(config, 'MARTINGALE_MAX_POSITIONS', 3)
@@ -185,6 +289,12 @@ class MartingaleManager:
         
         if self.has_position(symbol):
             logger.warning(f"Already have Martingale position for {symbol}")
+            return False
+        
+        # Check dynamic blacklist
+        if self.dynamic_blacklist.is_blacklisted(symbol):
+            status = self.dynamic_blacklist.get_blacklist_status(symbol)
+            logger.info(f"⏭️ Skipping {symbol} - Dynamic blacklist ({status['remaining_hours']:.1f}h remaining)")
             return False
         
         margin = self.STEPS[0]  # First step margin
@@ -652,6 +762,10 @@ class MartingaleManager:
                 logger.info(f"   Reason: {reason}")
                 logger.info(f"   Steps: {position.step} | Margin: ${position.total_margin}")
                 logger.info(f"   P&L: ${pnl:.2f} ({pnl_percent:.2f}%)")
+                
+                # Record stop loss if it was a loss closure
+                if pnl < 0 and ("stop" in reason.lower() or "emergency" in reason.lower() or "hard" in reason.lower()):
+                    self.dynamic_blacklist.record_stop_loss(symbol, reason, pnl)
                 
                 # Remove position
                 del self.positions[symbol]

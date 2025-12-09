@@ -188,7 +188,7 @@ class LegendaryScalper:
         try:
             while self.running:
                 self.run_cycle()
-                time.sleep(20)  # Check every 20 seconds
+                time.sleep(config.SCAN_INTERVAL_SECONDS)
                 
         except KeyboardInterrupt:
             logger.info("⛔ Stopping bot...")
