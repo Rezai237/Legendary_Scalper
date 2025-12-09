@@ -1,0 +1,705 @@
+"""
+Martingale Manager - Handle step-based counter-trend positions
+"""
+
+import time
+from typing import Dict, List, Optional
+from dataclasses import dataclass, field
+from datetime import datetime
+from logger import logger
+import config
+
+
+@dataclass
+class MartingalePosition:
+    """Track a Martingale position with multiple entries"""
+    symbol: str
+    side: str  # Always 'SELL' for short
+    entries: List[Dict] = field(default_factory=list)
+    step: int = 0
+    total_quantity: float = 0
+    total_margin: float = 0
+    average_entry: float = 0
+    created_at: datetime = field(default_factory=datetime.now)
+    last_step_time: datetime = field(default_factory=datetime.now)
+    half_closed: bool = False
+    recycle_count: int = 0  # Number of times margin was recycled
+    recycled_margin: float = 0  # Total margin freed via recycling
+    # Trailing TP fields
+    trailing_tp_active: bool = False  # True when in trailing mode
+    max_profit_usd: float = 0  # Maximum profit reached (for trailing)
+    
+
+class MartingaleManager:
+    """
+    Manage Martingale-style counter-trend positions
+    
+    - SHORT ONLY on pumped coins
+    - Ultra-light early steps
+    - Patient step timing
+    - Dynamic half-close
+    """
+    
+    # Load from config - extended to 15 steps for recycling strategy
+    # Load from config - extended to 15 steps
+    STEPS = getattr(config, 'MARTINGALE_STEPS', [
+        3, 3, 5, 5, 7, 10, 15, 20, 25, 30, 40, 50, 60, 80, 100
+    ])
+    
+    STEP_DISTANCES = getattr(config, 'MARTINGALE_STEP_DISTANCES', [
+        0, 3, 5, 8, 12, 16, 20, 25, 30, 35, 40, 45, 50, 60, 70
+    ])
+    
+    STEP_WAIT_TIMES = getattr(config, 'MARTINGALE_STEP_WAIT_TIMES', [
+        0, 2, 2, 3, 3, 5, 5, 10, 10, 15, 20, 30, 45, 60, 90
+    ])
+    
+    # Margin recycling settings
+    RECYCLE_AFTER_STEP = 5  # Start recycling after this step
+    MAX_RECYCLES = 10  # Maximum recycling operations per position
+    
+    # Dynamic position limits based on total margin
+    MARGIN_THRESHOLD = 200  # Dollar amount threshold
+    MAX_POSITIONS_BELOW_THRESHOLD = 8  # Max positions when margin < $200
+    MAX_POSITIONS_ABOVE_THRESHOLD = 4  # Max positions when margin >= $200
+    
+    def __init__(self, client, executor):
+        self.client = client
+        self.executor = executor
+        self.positions: Dict[str, MartingalePosition] = {}
+        
+        # Load settings from config if available
+        self.max_positions = getattr(config, 'MARTINGALE_MAX_POSITIONS', 3)
+        self.emergency_stop_percent = getattr(config, 'MARTINGALE_EMERGENCY_STOP', 20)
+        self.half_close_threshold = getattr(config, 'MARTINGALE_HALF_CLOSE_PERCENT', 2)
+        
+        logger.info("🎰 Martingale Manager initialized")
+        logger.info(f"   Steps: {self.STEPS}")
+        logger.info(f"   Dynamic limits: {self.MAX_POSITIONS_BELOW_THRESHOLD} pos < ${self.MARGIN_THRESHOLD}, {self.MAX_POSITIONS_ABOVE_THRESHOLD} pos >= ${self.MARGIN_THRESHOLD}")
+    
+    def recover_positions(self) -> int:
+        """
+        Recover existing positions from Binance on startup
+        
+        This allows the bot to continue managing positions after a restart
+        """
+        try:
+            # Get all open positions from Binance
+            positions = self.client.get_positions()
+            if not positions:
+                logger.info("📦 No existing positions to recover")
+                return 0
+            
+            recovered = 0
+            for pos in positions:
+                symbol = pos.get('symbol', '')
+                position_amt = float(pos.get('positionAmt', 0))
+                entry_price = float(pos.get('entryPrice', 0))
+                unrealized_pnl = float(pos.get('unRealizedProfit', 0))
+                
+                # Only recover SHORT positions (negative positionAmt)
+                if position_amt >= 0 or entry_price <= 0:
+                    continue
+                
+                # Calculate margin and estimate step based on quantity
+                quantity = abs(position_amt)
+                notional = quantity * entry_price
+                margin = notional / 10  # Assuming 10x leverage
+                
+                # Estimate step based on margin
+                step = self._estimate_step_from_margin(margin)
+                
+                # Create position object
+                martingale_pos = MartingalePosition(
+                    symbol=symbol,
+                    side='SELL',
+                    entries=[{
+                        'price': entry_price,
+                        'quantity': quantity,
+                        'margin': margin,
+                        'recovered': True
+                    }],
+                    step=step,
+                    total_quantity=quantity,
+                    total_margin=margin,
+                    average_entry=entry_price
+                )
+                
+                self.positions[symbol] = martingale_pos
+                recovered += 1
+                
+                logger.info(f"♻️ Recovered position: {symbol}")
+                logger.info(f"   Entry: {entry_price:.6f} | Qty: {quantity:.4f}")
+                logger.info(f"   Estimated Step: {step} | Margin: ${margin:.2f}")
+                logger.info(f"   UPnL: ${unrealized_pnl:.2f}")
+            
+            if recovered > 0:
+                logger.info(f"✅ Recovered {recovered} positions from Binance")
+            
+            return recovered
+            
+        except Exception as e:
+            logger.error(f"Failed to recover positions: {e}")
+            return 0
+    
+    def _estimate_step_from_margin(self, margin: float) -> int:
+        """Estimate which step based on total margin used"""
+        cumulative = 0
+        for i, step_margin in enumerate(self.STEPS):
+            cumulative += step_margin
+            if margin <= cumulative * 1.2:  # 20% tolerance
+                return i + 1
+        return len(self.STEPS)  # Max step
+    
+    def get_total_margin(self) -> float:
+        """Get total margin used across all positions"""
+        return sum(pos.total_margin for pos in self.positions.values())
+    
+    def get_dynamic_max_positions(self) -> int:
+        """Get max positions based on current total margin"""
+        total_margin = self.get_total_margin()
+        if total_margin >= self.MARGIN_THRESHOLD:
+            return self.MAX_POSITIONS_ABOVE_THRESHOLD
+        return self.MAX_POSITIONS_BELOW_THRESHOLD
+    
+    def can_open_new_position(self) -> bool:
+        """Check if we can open a new Martingale position"""
+        max_pos = self.get_dynamic_max_positions()
+        return len(self.positions) < max_pos
+    
+    def has_position(self, symbol: str) -> bool:
+        """Check if we have an active Martingale position"""
+        return symbol in self.positions
+    
+    def get_position(self, symbol: str) -> Optional[MartingalePosition]:
+        """Get Martingale position for symbol"""
+        return self.positions.get(symbol)
+    
+    def open_position(self, symbol: str, current_price: float) -> bool:
+        """
+        Open a new Martingale SHORT position (Step 1)
+        """
+        if not self.can_open_new_position():
+            logger.warning(f"Max Martingale positions reached ({self.max_positions})")
+            return False
+        
+        if self.has_position(symbol):
+            logger.warning(f"Already have Martingale position for {symbol}")
+            return False
+        
+        margin = self.STEPS[0]  # First step margin
+        
+        try:
+            # Calculate quantity
+            quantity = self._calculate_quantity(symbol, margin, current_price)
+            
+            if quantity <= 0:
+                logger.error(f"Invalid quantity for {symbol}")
+                return False
+            
+            # Setup symbol and execute SHORT entry
+            self.executor.setup_symbol(symbol)
+            result = self.client.place_market_order(
+                symbol=symbol,
+                side='SELL',
+                quantity=quantity
+            )
+            
+            if result:
+                # Create Martingale position
+                position = MartingalePosition(
+                    symbol=symbol,
+                    side='SELL',
+                    entries=[{
+                        'step': 1,
+                        'price': current_price,
+                        'quantity': quantity,
+                        'margin': margin,
+                        'time': datetime.now()
+                    }],
+                    step=1,
+                    total_quantity=quantity,
+                    total_margin=margin,
+                    average_entry=current_price
+                )
+                
+                self.positions[symbol] = position
+                
+                logger.info(f"🎰 Martingale Step 1: {symbol} SHORT")
+                logger.info(f"   Entry: {current_price:.6f} | Margin: ${margin}")
+                
+                return True
+            
+        except Exception as e:
+            logger.error(f"Failed to open Martingale position: {e}")
+        
+        return False
+    
+    def should_add_step(self, symbol: str, current_price: float) -> Dict:
+        """
+        Check if we should add another step to position
+        
+        Conditions:
+        - Price moved up enough (distance requirement)
+        - Enough time passed (patience requirement)
+        - Not at max steps
+        
+        Returns:
+            Dict with should_add, reason, step_num
+        """
+        position = self.get_position(symbol)
+        if not position:
+            return {'should_add': False, 'reason': 'No position'}
+        
+        current_step = position.step
+        max_steps = len(self.STEPS)
+        
+        if current_step >= max_steps:
+            return {'should_add': False, 'reason': 'Max steps reached'}
+        
+        next_step = current_step + 1
+        
+        # Calculate current unrealized loss in USD
+        current_loss = (current_price - position.average_entry) * position.total_quantity
+        margin_loss_percent = (current_loss / position.total_margin) * 100 if position.total_margin > 0 else 0
+        
+        # For steps 1-3: Use margin-loss based entry with progressive thresholds
+        # Step 1 → 2: 70% loss
+        # Step 2 → 3: 80% loss
+        # Step 3 → 4: 90% loss
+        # Step 4+: Eagle-eye mode (distance-based with confirmation)
+        if current_step <= 3:
+            # Progressive loss thresholds
+            if current_step == 1:
+                required_loss_percent = 70
+            elif current_step == 2:
+                required_loss_percent = 80
+            else:  # step 3
+                required_loss_percent = 90
+            
+            if margin_loss_percent < required_loss_percent:
+                return {
+                    'should_add': False,
+                    'reason': f'Margin loss {margin_loss_percent:.0f}% < {required_loss_percent}% required',
+                    'margin_loss': margin_loss_percent,
+                    'current_loss': current_loss
+                }
+            
+            # Loss threshold reached - ready for next step
+            return {
+                'should_add': True,
+                'reason': f'Margin loss {margin_loss_percent:.0f}% >= {required_loss_percent}% - Ready!',
+                'step_num': next_step,
+                'margin': self.STEPS[next_step - 1],
+                'margin_loss': margin_loss_percent,
+                'current_loss': current_loss
+            }
+        
+        # For steps 5+: Use distance-based entry (original logic)
+        distance_percent = ((current_price - position.average_entry) / position.average_entry) * 100
+        required_distance = self.STEP_DISTANCES[next_step - 1] if next_step <= len(self.STEP_DISTANCES) else 50
+        
+        # Time since last step
+        time_since_last = (datetime.now() - position.last_step_time).total_seconds() / 60
+        required_wait = self.STEP_WAIT_TIMES[next_step - 1] if next_step <= len(self.STEP_WAIT_TIMES) else 0
+        
+        # Check distance
+        if distance_percent < required_distance:
+            return {
+                'should_add': False,
+                'reason': f'Distance {distance_percent:.1f}% < {required_distance}% required',
+                'distance': distance_percent,
+                'time_waiting': time_since_last
+            }
+        
+        # Check time (can be overridden if distance is very high)
+        if time_since_last < required_wait:
+            # Allow override if distance is 1.5x required
+            if distance_percent < required_distance * 1.5:
+                return {
+                    'should_add': False,
+                    'reason': f'Wait time {time_since_last:.0f}min < {required_wait}min required',
+                    'distance': distance_percent,
+                    'time_waiting': time_since_last
+                }
+        
+        return {
+            'should_add': True,
+            'reason': f'Distance {distance_percent:.1f}% + Wait {time_since_last:.0f}min',
+            'step_num': next_step,
+            'margin': self.STEPS[next_step - 1],
+            'distance': distance_percent,
+            'time_waiting': time_since_last
+        }
+    
+    def add_step(self, symbol: str, current_price: float) -> bool:
+        """
+        Add another step to the Martingale position
+        """
+        position = self.get_position(symbol)
+        if not position:
+            return False
+        
+        next_step = position.step + 1
+        if next_step > len(self.STEPS):
+            return False
+        
+        margin = self.STEPS[next_step - 1]
+        
+        try:
+            quantity = self._calculate_quantity(symbol, margin, current_price)
+            
+            if quantity <= 0:
+                return False
+            
+            # Execute additional SHORT
+            result = self.client.place_market_order(
+                symbol=symbol,
+                side='SELL',
+                quantity=quantity
+            )
+            
+            if result:
+                # Update position
+                position.entries.append({
+                    'step': next_step,
+                    'price': current_price,
+                    'quantity': quantity,
+                    'margin': margin,
+                    'time': datetime.now()
+                })
+                
+                position.step = next_step
+                position.total_quantity += quantity
+                position.total_margin += margin
+                position.last_step_time = datetime.now()
+                
+                # Recalculate average entry
+                position.average_entry = self._calculate_average(position)
+                
+                logger.info(f"🎰 Martingale Step {next_step}: {symbol}")
+                logger.info(f"   Price: {current_price:.6f} | Margin: ${margin}")
+                logger.info(f"   New Avg: {position.average_entry:.6f} | Total Margin: ${position.total_margin}")
+                
+                return True
+                
+        except Exception as e:
+            logger.error(f"Failed to add Martingale step: {e}")
+        
+        return False
+    
+    def should_close_half(self, symbol: str, current_price: float) -> Dict:
+        """
+        Check if we should close half the position
+        
+        Condition: Price returned within threshold of average after step 3+
+        """
+        position = self.get_position(symbol)
+        if not position:
+            return {'should_close': False}
+        
+        if position.step < 3:
+            return {'should_close': False, 'reason': 'Step < 3'}
+        
+        if position.half_closed:
+            return {'should_close': False, 'reason': 'Already half-closed'}
+        
+        # For SHORT: profit when price drops (current < average)
+        # Negative distance = profit for SHORT
+        distance_to_avg = ((current_price - position.average_entry) / position.average_entry) * 100
+        
+        # Calculate actual P&L in USD
+        pnl_usd = (position.average_entry - current_price) * position.total_quantity
+        
+        # Step 3: Close half with small profit (even $0.50 is enough)
+        if position.step == 3:
+            if pnl_usd >= 0.5:  # Small profit threshold
+                return {
+                    'should_close': True,
+                    'reason': f'Step 3 + Small profit (${pnl_usd:.2f})',
+                    'pnl_usd': pnl_usd
+                }
+        
+        # Step 4+: Close half when price returns near average
+        if distance_to_avg <= self.half_close_threshold and distance_to_avg > -10:
+            return {
+                'should_close': True,
+                'reason': f'Price near average ({distance_to_avg:.1f}%)',
+                'distance': distance_to_avg
+            }
+        
+        return {'should_close': False, 'reason': f'Distance {distance_to_avg:.1f}%', 'pnl_usd': pnl_usd}
+    
+    def close_half(self, symbol: str, current_price: float) -> bool:
+        """Close half of the Martingale position"""
+        position = self.get_position(symbol)
+        if not position:
+            return False
+        
+        half_quantity = position.total_quantity / 2
+        
+        try:
+            # Close half (BUY to close SHORT)
+            result = self.client.place_market_order(
+                symbol=symbol,
+                side='BUY',
+                quantity=self.client.round_quantity(symbol, half_quantity)
+            )
+            
+            if result:
+                position.total_quantity = half_quantity
+                position.half_closed = True
+                
+                # Calculate P&L on closed portion
+                pnl = (position.average_entry - current_price) * half_quantity
+                
+                logger.info(f"🎰 Half-Close: {symbol}")
+                logger.info(f"   Closed: {half_quantity:.4f} @ {current_price:.6f}")
+                logger.info(f"   P&L: ${pnl:.2f}")
+                
+                return True
+                
+        except Exception as e:
+            logger.error(f"Failed to close half: {e}")
+        
+        return False
+    
+    def should_auto_close_early(self, symbol: str, current_price: float) -> Dict:
+        """
+        Check if we should auto-close an early step position to free margin
+        
+        Conditions:
+        - Total margin >= $100 threshold
+        - Position is at step 1-3
+        - Position has small profit (>= $0.50) OR small loss (<= $1)
+        - We have more positions than MAX_POSITIONS_ABOVE_THRESHOLD
+        """
+        position = self.get_position(symbol)
+        if not position:
+            return {'should_close': False}
+        
+        total_margin = self.get_total_margin()
+        
+        # Only trigger when margin is at threshold
+        if total_margin < self.MARGIN_THRESHOLD:
+            return {'should_close': False, 'reason': f'Margin ${total_margin:.0f} < ${self.MARGIN_THRESHOLD}'}
+        
+        # Only close early step positions (1-3)
+        if position.step > 3:
+            return {'should_close': False, 'reason': f'Step {position.step} > 3'}
+        
+        # Only trigger when we have too many positions
+        if len(self.positions) <= self.MAX_POSITIONS_ABOVE_THRESHOLD:
+            return {'should_close': False, 'reason': f'Only {len(self.positions)} positions'}
+        
+        # Calculate P&L
+        pnl_usd = (position.average_entry - current_price) * position.total_quantity
+        
+        # Close if small profit (>= $0.50) or small loss (<= $1)
+        if pnl_usd >= 0.5:
+            return {
+                'should_close': True,
+                'reason': f'Small profit ${pnl_usd:.2f} - freeing margin',
+                'pnl_usd': pnl_usd
+            }
+        
+        if pnl_usd >= -1.0:  # Small loss up to $1
+            return {
+                'should_close': True,
+                'reason': f'Small loss ${pnl_usd:.2f} - freeing margin',
+                'pnl_usd': pnl_usd
+            }
+        
+        return {'should_close': False, 'reason': f'P&L ${pnl_usd:.2f} not in range', 'pnl_usd': pnl_usd}
+    
+    def should_recycle_margin(self, symbol: str, current_price: float) -> Dict:
+        """
+        Check if we should recycle margin to allow more steps
+        
+        Conditions:
+        - Step >= RECYCLE_AFTER_STEP (5)
+        - Price has returned closer to average (within 1%)
+        - Haven't exceeded MAX_RECYCLES
+        """
+        position = self.get_position(symbol)
+        if not position:
+            return {'should_recycle': False}
+        
+        if position.step < self.RECYCLE_AFTER_STEP:
+            return {'should_recycle': False, 'reason': f'Step {position.step} < {self.RECYCLE_AFTER_STEP}'}
+        
+        if position.recycle_count >= self.MAX_RECYCLES:
+            return {'should_recycle': False, 'reason': f'Max recycles reached ({self.MAX_RECYCLES})'}
+        
+        # For SHORT: check if price has come down closer to average
+        distance_to_avg = ((current_price - position.average_entry) / position.average_entry) * 100
+        
+        # Recycle when price returns within 1% of average (small profit zone)
+        if distance_to_avg <= 1 and distance_to_avg > -3:
+            return {
+                'should_recycle': True,
+                'reason': f'Price near average ({distance_to_avg:.1f}%), recycling margin',
+                'distance': distance_to_avg
+            }
+        
+        return {'should_recycle': False, 'reason': f'Distance {distance_to_avg:.1f}%'}
+    
+    def recycle_margin(self, symbol: str, current_price: float) -> bool:
+        """
+        Recycle margin by closing half position to free up for more steps
+        
+        This allows extending from 9 steps to 15+ steps
+        """
+        position = self.get_position(symbol)
+        if not position:
+            return False
+        
+        if position.total_quantity <= 0:
+            return False
+        
+        # Close 40% of position (not full half, to keep some exposure)
+        recycle_quantity = position.total_quantity * 0.4
+        
+        try:
+            result = self.client.place_market_order(
+                symbol=symbol,
+                side='BUY',  # Close SHORT
+                quantity=self.client.round_quantity(symbol, recycle_quantity)
+            )
+            
+            if result:
+                # Calculate P&L on recycled portion
+                pnl = (position.average_entry - current_price) * recycle_quantity
+                
+                # Calculate freed margin
+                freed_margin = position.total_margin * 0.4
+                
+                # Update position
+                position.total_quantity -= recycle_quantity
+                position.total_margin -= freed_margin
+                position.recycle_count += 1
+                position.recycled_margin += freed_margin
+                
+                logger.info(f"♻️ Margin Recycled: {symbol}")
+                logger.info(f"   Closed: {recycle_quantity:.4f} @ {current_price:.6f}")
+                logger.info(f"   P&L: ${pnl:.2f} | Freed: ${freed_margin:.2f}")
+                logger.info(f"   Recycle #{position.recycle_count} | Total freed: ${position.recycled_margin:.2f}")
+                
+                return True
+                
+        except Exception as e:
+            logger.error(f"Failed to recycle margin: {e}")
+        
+        return False
+    
+    def should_emergency_close(self, symbol: str, current_price: float) -> Dict:
+        """
+        Check if we should emergency close position
+        
+        Condition: Drawdown exceeds threshold
+        """
+        position = self.get_position(symbol)
+        if not position:
+            return {'should_close': False}
+        
+        # For SHORT: loss when price goes up
+        drawdown_percent = ((current_price - position.average_entry) / position.average_entry) * 100
+        
+        # Calculate USD loss
+        usd_loss = (position.average_entry - current_price) * position.total_quantity
+        hard_stop_usd = getattr(config, 'MARTINGALE_HARD_STOP_USD', 55)
+        
+        # 1. USD Hard Stop
+        # Note: usd_loss is negative when losing
+        if usd_loss <= -hard_stop_usd:
+             return {
+                'should_close': True,
+                'reason': f'🚨 HARD STOP: Loss ${abs(usd_loss):.2f} > ${hard_stop_usd}',
+                'drawdown': drawdown_percent,
+                'pnl': usd_loss
+            }
+        
+        # 2. Percentage Drawdown Stop
+        if drawdown_percent >= self.emergency_stop_percent:
+            return {
+                'should_close': True,
+                'reason': f'Emergency! Drawdown {drawdown_percent:.1f}%',
+                'drawdown': drawdown_percent
+            }
+        
+        return {'should_close': False, 'drawdown': drawdown_percent}
+    
+    def close_position(self, symbol: str, current_price: float, reason: str = "") -> bool:
+        """Close entire Martingale position"""
+        position = self.get_position(symbol)
+        if not position:
+            return False
+        
+        try:
+            # Close all (BUY to close SHORT)
+            result = self.client.place_market_order(
+                symbol=symbol,
+                side='BUY',
+                quantity=self.client.round_quantity(symbol, position.total_quantity)
+            )
+            
+            if result:
+                # Calculate final P&L
+                pnl = (position.average_entry - current_price) * position.total_quantity
+                pnl_percent = ((position.average_entry - current_price) / position.average_entry) * 100
+                
+                logger.info(f"🎰 Position Closed: {symbol}")
+                logger.info(f"   Reason: {reason}")
+                logger.info(f"   Steps: {position.step} | Margin: ${position.total_margin}")
+                logger.info(f"   P&L: ${pnl:.2f} ({pnl_percent:.2f}%)")
+                
+                # Remove position
+                del self.positions[symbol]
+                
+                return True
+                
+        except Exception as e:
+            logger.error(f"Failed to close position: {e}")
+        
+        return False
+    
+    def _calculate_quantity(self, symbol: str, margin: float, price: float) -> float:
+        """Calculate position quantity from margin"""
+        leverage = getattr(config, 'LEVERAGE', 5)
+        position_value = margin * leverage
+        quantity = position_value / price
+        return self.client.round_quantity(symbol, quantity)
+    
+    def _calculate_average(self, position: MartingalePosition) -> float:
+        """Calculate weighted average entry price"""
+        if not position.entries:
+            return 0
+        
+        total_value = sum(e['price'] * e['quantity'] for e in position.entries)
+        total_qty = sum(e['quantity'] for e in position.entries)
+        
+        return total_value / total_qty if total_qty > 0 else 0
+    
+    def get_status(self) -> Dict:
+        """Get status of all Martingale positions"""
+        status = {
+            'active_positions': len(self.positions),
+            'positions': {}
+        }
+        
+        for symbol, pos in self.positions.items():
+            status['positions'][symbol] = {
+                'step': pos.step,
+                'total_margin': pos.total_margin,
+                'average_entry': pos.average_entry,
+                'half_closed': pos.half_closed,
+                'entries': len(pos.entries)
+            }
+        
+        return status
+
+
+if __name__ == "__main__":
+    print("Martingale Manager loaded successfully!")
+    print(f"Steps: {MartingaleManager.STEPS}")
+    print(f"Total max margin: ${sum(MartingaleManager.STEPS)}")
