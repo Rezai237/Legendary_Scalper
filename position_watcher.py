@@ -119,8 +119,8 @@ class PositionWatcher:
         """
         Check if position should take profit with TRAILING TP
         
-        Dynamic TP based on step level:
-        - Step 1: $3 profit
+        Dynamic TP activation threshold:
+        - Step 1: $3.5 profit
         - Step 2: $4 profit
         - Step 3: $6 profit
         - Step 4: $8 profit
@@ -129,17 +129,18 @@ class PositionWatcher:
         - Step 8+: $20 profit
         
         Trailing TP:
-        - Activates when profit > target
-        - Tracks max profit
-        - Closes when profit drops 30% from max
+        - Activates when profit >= threshold
+        - Tracks max profit seen
+        - Closes when profit drops 30% from max (even if below threshold)
+        - Only resets if profit drops below $0.50
         """
         # Calculate actual P&L in USD
         pnl_usd = (position.average_entry - current_price) * position.total_quantity
         
-        # Dynamic TP target based on step
+        # Dynamic TP activation threshold based on step
         step = position.step
         if step <= 1:
-            tp_target = 3
+            tp_target = 3.5  # Activate trailing at $3.5
         elif step == 2:
             tp_target = 4
         elif step == 3:
@@ -156,32 +157,34 @@ class PositionWatcher:
         # TRAILING TP LOGIC
         trailing_callback = 0.30  # Close if profit drops 30% from max
         
-        # If profit exceeds target, activate trailing mode
-        if pnl_usd >= tp_target:
-            # Activate trailing if not already
-            if not position.trailing_tp_active:
-                position.trailing_tp_active = True
-                position.max_profit_usd = pnl_usd
-                logger.info(f"🎯 {position.symbol}: Trailing TP activated at ${pnl_usd:.2f}")
-            
+        # CASE 1: Trailing is already active
+        if position.trailing_tp_active:
             # Update max profit if current is higher
             if pnl_usd > position.max_profit_usd:
                 position.max_profit_usd = pnl_usd
                 logger.debug(f"📈 {position.symbol}: New max profit ${pnl_usd:.2f}")
             
-            # Check if profit dropped from max (trailing callback)
-            profit_drop_percent = (position.max_profit_usd - pnl_usd) / position.max_profit_usd if position.max_profit_usd > 0 else 0
+            # Check for 30% callback from max (THIS RUNS EVEN IF BELOW TARGET)
+            if position.max_profit_usd > 0:
+                profit_drop_percent = (position.max_profit_usd - pnl_usd) / position.max_profit_usd
+                
+                if profit_drop_percent >= trailing_callback:
+                    return {
+                        'should_close': True,
+                        'reason': f'Trailing TP hit (${pnl_usd:.2f}, max was ${position.max_profit_usd:.2f})',
+                        'pnl_usd': pnl_usd,
+                        'tp_target': tp_target,
+                        'max_profit': position.max_profit_usd
+                    }
             
-            if profit_drop_percent >= trailing_callback:
-                return {
-                    'should_close': True,
-                    'reason': f'Trailing TP hit (${pnl_usd:.2f}, max was ${position.max_profit_usd:.2f})',
-                    'pnl_usd': pnl_usd,
-                    'tp_target': tp_target,
-                    'max_profit': position.max_profit_usd
-                }
+            # Reset trailing only if profit drops very low (below $0.50)
+            if pnl_usd < 0.50:
+                position.trailing_tp_active = False
+                position.max_profit_usd = 0
+                logger.info(f"🔄 {position.symbol}: Trailing reset (profit ${pnl_usd:.2f})")
+                return {'should_close': False, 'pnl_usd': pnl_usd, 'tp_target': tp_target}
             
-            # Still above target, trail further
+            # Continue trailing
             return {
                 'should_close': False, 
                 'pnl_usd': pnl_usd, 
@@ -190,11 +193,21 @@ class PositionWatcher:
                 'max_profit': position.max_profit_usd
             }
         
-        # Reset trailing if profit dropped below target
-        if position.trailing_tp_active and pnl_usd < tp_target * 0.5:
-            position.trailing_tp_active = False
-            position.max_profit_usd = 0
+        # CASE 2: Trailing not yet active - check if should activate
+        if pnl_usd >= tp_target:
+            position.trailing_tp_active = True
+            position.max_profit_usd = pnl_usd
+            logger.info(f"🎯 {position.symbol}: Trailing TP activated at ${pnl_usd:.2f}")
+            
+            return {
+                'should_close': False, 
+                'pnl_usd': pnl_usd, 
+                'tp_target': tp_target,
+                'trailing': True,
+                'max_profit': position.max_profit_usd
+            }
         
+        # CASE 3: Not trailing, not at target yet
         return {'should_close': False, 'pnl_usd': pnl_usd, 'tp_target': tp_target}
     
     def _confirm_step_entry(self, symbol: str, current_price: float, step_num: int) -> bool:
