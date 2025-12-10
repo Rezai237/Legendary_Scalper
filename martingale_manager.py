@@ -794,6 +794,99 @@ class MartingaleManager:
         
         return total_value / total_qty if total_qty > 0 else 0
     
+    def sync_positions(self) -> Dict:
+        """
+        Sync internal position tracking with Binance's actual positions
+        
+        This fixes quantity/margin mismatches that can occur from:
+        - Half-closes not updating correctly
+        - Partial fills
+        - Manual interventions
+        - Bot restarts
+        
+        Returns:
+            Dict with sync results (updated, removed, added)
+        """
+        results = {'updated': [], 'removed': [], 'added': [], 'errors': []}
+        
+        try:
+            # Get all open positions from Binance
+            binance_positions = self.client.get_positions()
+            binance_symbols = set()
+            
+            for pos in binance_positions:
+                symbol = pos.get('symbol', '')
+                position_amt = float(pos.get('positionAmt', 0))
+                entry_price = float(pos.get('entryPrice', 0))
+                
+                # Only process SHORT positions (negative positionAmt)
+                if position_amt >= 0 or entry_price <= 0:
+                    continue
+                
+                binance_symbols.add(symbol)
+                quantity = abs(position_amt)
+                notional = quantity * entry_price
+                margin = notional / 10  # Assuming 10x leverage
+                
+                if symbol in self.positions:
+                    # Update existing position
+                    local_pos = self.positions[symbol]
+                    old_qty = local_pos.total_quantity
+                    old_margin = local_pos.total_margin
+                    
+                    # Check for significant differences
+                    qty_diff = abs(local_pos.total_quantity - quantity)
+                    if qty_diff > 0.001 * quantity:  # More than 0.1% difference
+                        local_pos.total_quantity = quantity
+                        local_pos.total_margin = margin
+                        local_pos.average_entry = entry_price
+                        results['updated'].append({
+                            'symbol': symbol,
+                            'old_qty': old_qty,
+                            'new_qty': quantity,
+                            'old_margin': old_margin,
+                            'new_margin': margin
+                        })
+                        logger.info(f"🔄 Synced {symbol}: Qty {old_qty:.4f}→{quantity:.4f}, Margin ${old_margin:.2f}→${margin:.2f}")
+                else:
+                    # Position exists on Binance but not tracked locally - add it
+                    step = self._estimate_step_from_margin(margin)
+                    new_pos = MartingalePosition(
+                        symbol=symbol,
+                        side='SELL',
+                        entries=[{
+                            'price': entry_price,
+                            'quantity': quantity,
+                            'margin': margin,
+                            'synced': True
+                        }],
+                        step=step,
+                        total_quantity=quantity,
+                        total_margin=margin,
+                        average_entry=entry_price
+                    )
+                    self.positions[symbol] = new_pos
+                    results['added'].append(symbol)
+                    logger.info(f"➕ Added untracked position: {symbol} (Step {step}, ${margin:.2f})")
+            
+            # Check for positions we track but no longer exist on Binance
+            tracked_symbols = list(self.positions.keys())
+            for symbol in tracked_symbols:
+                if symbol not in binance_symbols:
+                    del self.positions[symbol]
+                    results['removed'].append(symbol)
+                    logger.info(f"➖ Removed closed position: {symbol}")
+            
+            # Log summary
+            if results['updated'] or results['removed'] or results['added']:
+                logger.info(f"🔄 Sync complete: {len(results['updated'])} updated, {len(results['removed'])} removed, {len(results['added'])} added")
+            
+        except Exception as e:
+            logger.error(f"Position sync failed: {e}")
+            results['errors'].append(str(e))
+        
+        return results
+    
     def get_status(self) -> Dict:
         """Get status of all Martingale positions"""
         status = {
