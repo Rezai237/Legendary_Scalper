@@ -202,8 +202,7 @@ class PositionWatcher:
             self.martingale.save_positions_state()
             logger.info(f"🎯 {position.symbol}: Trailing TP activated at ${pnl_usd:.2f}")
             
-            # Activate visual trailing (Cancel TP, Move Stop to BE)
-            self.martingale.activate_trailing_mode(position.symbol)
+            # Visual trailing removed by request - internal logic only
             
             return {
                 'should_close': False, 

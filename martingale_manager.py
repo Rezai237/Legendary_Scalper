@@ -353,8 +353,8 @@ class MartingaleManager:
                 logger.info(f"🎰 Martingale Step 1: {symbol} SHORT")
                 logger.info(f"   Entry: {current_price:.6f} | Margin: ${margin}")
                 
-                # Place visual orders (stop, TP)
-                self.place_visual_orders(symbol)
+                # Visual orders removed by request
+
                 
                 # Save persistence
                 self.save_positions_state()
@@ -512,8 +512,8 @@ class MartingaleManager:
                 logger.info(f"   Price: {current_price:.6f} | Margin: ${margin}")
                 logger.info(f"   New Avg: {position.average_entry:.6f} | Total Margin: ${position.total_margin}")
                 
-                # Update visual orders (new avg entry)
-                self.update_visual_orders(symbol)
+                # Visual orders removed
+
                 
                 # Save persistence
                 self.save_positions_state()
@@ -812,8 +812,8 @@ class MartingaleManager:
                 if pnl < 0 and ("stop" in reason.lower() or "emergency" in reason.lower() or "hard" in reason.lower()):
                     self.dynamic_blacklist.record_stop_loss(symbol, reason, pnl)
                 
-                # Cancel visual orders
-                self.cancel_visual_orders(symbol)
+                # Visual orders removed
+
                 
                 # Remove position
                 del self.positions[symbol]
@@ -948,207 +948,7 @@ class MartingaleManager:
         
         return results
     
-    def place_visual_orders(self, symbol: str):
-        """
-        Place visual orders for a position (stop, TP, and step limits)
-        """
-        # DISABLED BY USER REQUEST - Relying on Internal Logic + Dashboard
-        return
-        
-        position = self.get_position(symbol)
-        if not position:
-            return
-        
-        try:
-            # Cancel any existing orders first
-            self.cancel_visual_orders(symbol)
-            
-            # 1. Emergency stop - 35% above average
-            emergency_stop_price = position.average_entry * 1.35
-            stop_order = self.client.place_stop_market(
-                symbol=symbol,
-                side='BUY',  # Close SHORT
-                quantity=position.total_quantity,
-                stop_price=emergency_stop_price
-            )
-            if stop_order:
-                position.stop_order_id = stop_order.get('orderId')
-                logger.info(f"📍 Emergency stop placed @ {emergency_stop_price:.6f}")
-            
-            # 2. NO Take Profit orders - ALL steps use trailing logic for exits
-            # Trailing activates when profit reaches threshold, then tracks max profit
-            # and closes when profit drops 30% from peak
-            logger.info(f"📊 No TP visual order - trailing handles exit for Step {position.step}")
-            
-            # 3. Step limit orders - DISABLED
-            # These orders fill automatically on Binance and break internal tracking
-            # The bot's step management expects to control when steps are added
-            # For now, only show step entries via the bot's internal logic
-            logger.info(f"📊 Visual orders: Emergency Stop only (step entries managed internally)")
-            
-            logger.info(f"✅ Visual orders placed for {symbol}")
-        except Exception as e:
-            logger.error(f"Failed to place visual orders for {symbol}: {e}")
-    
-    def global_cleanup_visual_orders(self):
-        """Cancel ALL conditional orders on startup to clean up orphans from closed positions"""
-        try:
-            # Get all open algo orders (no symbol filter = all symbols)
-            algo_orders = self.client.get_open_algo_orders()
-            if not algo_orders:
-                return
-            
-            cancelled_count = 0
-            for order in algo_orders:
-                symbol = order.get('symbol')
-                algo_id = order.get('algoId')
-                if algo_id and self.client.cancel_order(symbol, algo_id):
-                    cancelled_count += 1
-            
-            if cancelled_count > 0:
-                logger.info(f"🧹 Global cleanup: Cancelled {cancelled_count} orphaned algo orders")
-        except Exception as e:
-            logger.debug(f"Error during global cleanup: {e}")
-    
-    def cancel_all_conditional_orders(self, symbol: str):
-        """Cancel all open conditional (algo) orders for a symbol to prevent duplicates"""
-        try:
-            cancelled_count = 0
-            
-            # Check BOTH standard and algo order endpoints
-            standard_orders = self.client.get_open_orders(symbol)
-            algo_orders = self.client.get_open_algo_orders(symbol)
-            
-            # Cancel standard conditional orders
-            for order in standard_orders:
-                if order.get('type') in ['STOP_MARKET', 'TAKE_PROFIT_MARKET', 'STOP', 'TAKE_PROFIT']:
-                    order_id = order.get('orderId')
-                    if self.client.cancel_order(symbol, order_id):
-                        cancelled_count += 1
-            
-            # Cancel algo orders
-            for order in algo_orders:
-                algo_id = order.get('algoId')
-                if algo_id and self.client.cancel_order(symbol, algo_id):
-                    cancelled_count += 1
-            
-            if cancelled_count > 0:
-                logger.info(f"🧹 Cleaned up {cancelled_count} duplicate conditional orders for {symbol}")
-        except Exception as e:
-            logger.debug(f"Error cleaning up orders for {symbol}: {e}")
-    
-    def update_visual_orders(self, symbol: str):
-        """
-        Update visual orders after a step is added (new average entry)
-        """
-        position = self.get_position(symbol)
-        if not position:
-            return
-        
-        try:
-            # Cancel and re-place all orders with new average
-            logger.info(f"🔄 Updating visual orders for {symbol} (new avg: {position.average_entry:.6f})")
-            self.place_visual_orders(symbol)
-            
-        except Exception as e:
-            logger.error(f"Failed to update visual orders for {symbol}: {e}")
-    
-    def activate_trailing_mode(self, symbol: str):
-        """
-        Trailing Activated: Cancel TP and move Stop to slightly above BE
-        """
-        position = self.get_position(symbol)
-        if not position:
-            return
-        
-        try:
-            # Clean up any duplicate orders first
-            self.cancel_all_conditional_orders(symbol)
-            
-            # 1. Cancel TP (let profit run)
-            if position.tp_order_id:
-                success = self.client.cancel_order(symbol, position.tp_order_id)
-                if success:
-                    position.tp_order_id = None
-                    logger.info(f"✨ Trailing Active: Cancelled TP visual order for {symbol}")
-            
-            # 2. Move Stop to secure profit (tighter than emergency stop)
-            # SHORT: Stop should be slightly below entry to lock in profit
-            # If price rises back to this level, we exit with small profit secured
-            profit_protection_stop = position.average_entry * 0.9985  # 0.15% below entry
-            
-            if position.stop_order_id:
-                self.client.cancel_order(symbol, position.stop_order_id)
-            
-            # Place new protective stop (tighter than emergency stop)
-            stop_order = self.client.place_stop_market(
-                symbol=symbol,
-                side='BUY',
-                quantity=position.total_quantity,
-                stop_price=profit_protection_stop
-            )
-            if stop_order:
-                position.stop_order_id = stop_order.get('algoId') or stop_order.get('orderId')
-                logger.info(f"📍 Moved Stop to {profit_protection_stop:.6f} (0.15% below entry = profit secured)")
-                
-        except Exception as e:
-            logger.error(f"Failed to activate visual trailing for {symbol}: {e}")
-    
-    def cancel_visual_orders(self, symbol: str):
-        """
-        Cancel all visual orders for a position
-        """
-        position = self.get_position(symbol)
-        if not position:
-            return
-        
-        try:
-            # Cancel emergency stop
-            if position.stop_order_id:
-                self.client.cancel_order(symbol, position.stop_order_id)
-                position.stop_order_id = None
-            
-            # Cancel TP
-            if position.tp_order_id:
-                self.client.cancel_order(symbol, position.tp_order_id)
-                position.tp_order_id = None
-            
-            # Cancel trailing stop
-            if position.trailing_order_id:
-                self.client.cancel_order(symbol, position.trailing_order_id)
-                position.trailing_order_id = None
-            
-            # Cancel step limit orders
-            for order_id in position.step_order_ids:
-                self.client.cancel_order(symbol, order_id)
-            position.step_order_ids = []
-            
-            logger.debug(f"Cancelled visual orders for {symbol}")
-            
-        except Exception as e:
-            logger.error(f"Failed to cancel visual orders for {symbol}: {e}")
-    
-    def recover_visual_orders(self, symbol: str):
-        """
-        Recover/verify visual orders on bot restart
-        """
-        # DISABLED BY USER REQUEST
-        return
-        
-        position = self.get_position(symbol)
-        if not position:
-            return
-        
-        try:
-            # Clean up ALL conditional orders for this symbol (prevents duplicates)
-            logger.info(f"🔧 Recovering visual orders for {symbol}")
-            self.cancel_all_conditional_orders(symbol)
-            
-            # Place fresh orders
-            self.place_visual_orders(symbol)
-            
-        except Exception as e:
-            logger.error(f"Failed to recover visual orders for {symbol}: {e}")
+
     
     def get_balance(self) -> float:
         """Get current USDT balance"""

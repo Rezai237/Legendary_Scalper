@@ -85,13 +85,7 @@ To switch to **Real Money**:
 - **Smart Half-Close:** Now requires meaningful profit (Step 3: $3, Step 5: $5, etc.) before half-closing positions
 - **Margin Recycling:** Disabled to allow positions to reach full TP targets without premature reduction
 
-### 🧪 Visual Orders (Testnet Limitation)
-**Status:** Automatically **DISABLED** on Testnet, **ENABLED** on Live.
 
-Binance Testnet does not support `STOP_MARKET` or `TAKE_PROFIT` order types on the standard Futures endpoint. The bot operates normally (opens/closes positions, manages Martingale steps, tracks profit/loss) but will NOT place visual stop/TP lines on charts when `USE_TESTNET = True`.
-
-**To Enable Visual Orders:**
-Simply set `USE_TESTNET = False` in `config.py` and restart the bot. Visual orders will automatically activate on Live API.
 
 ## ⚠️ Disclaimer
 This software is for educational purposes only. Cryptocurrency trading involves high risk. The authors are not responsible for any financial losses incurred while using this bot. **Use at your own risk.**
