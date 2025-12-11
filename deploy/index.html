@@ -109,7 +109,9 @@
         <div>
             <h1 class="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-yellow-400 to-yellow-600">
                 LEGENDARY</h1>
-            <p class="text-xs text-gray-500">Remote Control • Live</p>
+            <p class="text-xs text-gray-500">Remote Control • Live <span
+                    class="text-[0.6rem] text-green-600 border border-green-900 rounded px-1 ml-2">v1.1 (Secure)</span>
+            </p>
         </div>
         <div id="connectionStatus" class="h-3 w-3 rounded-full bg-red-500 shadow-[0_0_10px_red]"></div>
     </div>
@@ -190,15 +192,48 @@
             class="hidden mt-2 p-2 bg-black text-[0.6rem] text-green-500 overflow-x-auto text-left rounded border border-gray-800 h-32"></pre>
     </div>
 
+    <!-- Login Overlay -->
+    <div id="loginOverlay" class="fixed inset-0 bg-[#121212] z-50 flex flex-col items-center justify-center p-6 hidden">
+        <div class="card w-full max-w-sm p-6 text-center">
+            <h1
+                class="text-3xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-yellow-400 to-yellow-600 mb-2">
+                LEGENDARY</h1>
+            <p class="text-sm text-gray-500 mb-6">Connect to your Bot Brain</p>
+
+            <div class="space-y-4 text-left">
+                <div>
+                    <label class="text-xs text-gray-400">Supabase URL</label>
+                    <input type="text" id="inpUrl" placeholder="https://xyz.supabase.co"
+                        class="w-full bg-black border border-gray-800 rounded p-2 text-sm text-white focus:border-yellow-500 outline-none">
+                </div>
+                <div>
+                    <label class="text-xs text-gray-400">Supabase Key (Anon)</label>
+                    <input type="password" id="inpKey" placeholder="eyJ..."
+                        class="w-full bg-black border border-gray-800 rounded p-2 text-sm text-white focus:border-yellow-500 outline-none">
+                </div>
+                <button onclick="saveAndConnect()" class="btn btn-start mt-2">CONNECT 🚀</button>
+            </div>
+            <p class="text-[0.65rem] text-gray-600 mt-4">Credentials are saved locally in your browser.</p>
+        </div>
+    </div>
+
+    <!-- Disconnect Button (Top Right) -->
+    <div class="fixed top-4 right-4 z-40">
+        <button onclick="disconnect()"
+            class="text-[0.6rem] text-gray-600 hover:text-red-500 underline">Disconnect</button>
+    </div>
+
     <script>
-        // CONFIGURATION
-        const SUPABASE_URL = "https://rzwjvmtypqmnrjcxaymy.supabase.co";
-        const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJ6d2p2bXR5cHFtbnJqY3hheW15Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjU0MDA0MDYsImV4cCI6MjA4MDk3NjQwNn0.FtQNBLhk43cG3CrbkaQ2rmhM60xeMKuvNumaA8mh5xg";
+        // ELEMENTS
+        const elLogin = document.getElementById('loginOverlay');
+        const elInpUrl = document.getElementById('inpUrl');
+        const elInpKey = document.getElementById('inpKey');
 
-        const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
-        const botId = 1;
+        // GLOBAL STATE
+        let supabase = null;
+        let botId = 1;
 
-        // Elements
+        // Elements (Logic)
         const elBalance = document.getElementById('balance');
         const elActivePos = document.getElementById('activePos');
         const elPnl = document.getElementById('pnl');
@@ -213,14 +248,66 @@
 
         // State
         let isRunning = false;
-        let lastLogTime = null;
 
         async function init() {
-            console.log("Initializing...");
+            // Check LocalStorage
+            const savedUrl = localStorage.getItem('ls_supa_url');
+            const savedKey = localStorage.getItem('ls_supa_key');
+
+            if (savedUrl && savedKey) {
+                connect(savedUrl, savedKey);
+            } else {
+                showLogin();
+            }
+        }
+
+        function showLogin() {
+            elLogin.classList.remove('hidden');
+        }
+
+        function saveAndConnect() {
+            const url = elInpUrl.value.trim();
+            const key = elInpKey.value.trim();
+
+            if (!url || !key) {
+                alert("Please enter both URL and Key");
+                return;
+            }
+
+            localStorage.setItem('ls_supa_url', url);
+            localStorage.setItem('ls_supa_key', key);
+
+            connect(url, key);
+        }
+
+        function disconnect() {
+            if (confirm("Disconnect from this bot?")) {
+                localStorage.removeItem('ls_supa_url');
+                localStorage.removeItem('ls_supa_key');
+                window.location.reload();
+            }
+        }
+
+        async function connect(url, key) {
+            try {
+                window.supabaseClient = window.supabase.createClient(url, key);
+                supabase = window.supabaseClient;
+                elLogin.classList.add('hidden');
+                console.log("Connected to Supabase!");
+                startMonitoring();
+            } catch (e) {
+                alert("Connection failed: " + e.message);
+                showLogin();
+            }
+        }
+
+        async function startMonitoring() {
+            console.log("Initializing Monitoring...");
 
             // 1. Initial State Fetch
             const { data, error } = await supabase.from('bot_state').select('*').eq('id', botId).single();
             if (data) updateUI(data);
+            if (error) console.error("Fetch error:", error);
 
             // 2. Initial Logs Fetch (Last 50)
             fetchLogs();
@@ -260,7 +347,9 @@
             const div = document.createElement('div');
             const time = new Date(log.timestamp).toLocaleTimeString([], { hour12: false });
             div.className = `log-entry log-${log.level}`;
-            div.innerHTML = `<span class="opacity-50">[${time}]</span> ${log.message}`;
+            // Strip ANSI codes
+            const cleanMessage = log.message.replace(/\x1b\[[0-9;]*m/g, '');
+            div.innerHTML = `<span class="opacity-50">[${time}]</span> ${cleanMessage}`;
             elLogs.appendChild(div);
             elLogs.scrollTop = elLogs.scrollHeight;
         }
@@ -301,8 +390,6 @@
                 } else if (typeof state.positions_json === 'string') {
                     json = JSON.parse(state.positions_json || '{}');
                 }
-
-                console.log("Parsed State:", json); // DEBUG
 
                 if (json.positions) {
                     // New Format
