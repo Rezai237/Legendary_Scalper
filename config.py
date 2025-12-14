@@ -183,10 +183,10 @@ VISION_MIN_CONFIDENCE = 65      # Minimum Vision confidence % (0-100)
 # MARTINGALE SCALPER SETTINGS (Counter-Trend Strategy)
 # =============================================================================
 MARTINGALE_ENABLED = True       # Enable Martingale mode
-MARTINGALE_MIN_PUMP = 20        # Minimum pump % to consider coin (20%+)
+MARTINGALE_MIN_PUMP = 30        # Minimum pump % to consider coin (30%+)
 MARTINGALE_MAX_POSITIONS = 5    # Max concurrent Martingale positions
-MARTINGALE_EMERGENCY_STOP = 20  # Emergency close at -20% drawdown (percentage based)
-MARTINGALE_HARD_STOP_USD = 55   # Emergency close at -$55 loss (dollar based)
+MARTINGALE_EMERGENCY_STOP = 35  # Emergency close at -35% drawdown (allows all 9 steps)
+MARTINGALE_HARD_STOP_USD = 100  # Emergency close at -$100 loss (dollar based)
 MARTINGALE_HALF_CLOSE_PERCENT = 2  # Close half when within 2% of average
 MARTINGALE_TP_PERCENT = 1.5     # Take profit at 1.5% profit
 

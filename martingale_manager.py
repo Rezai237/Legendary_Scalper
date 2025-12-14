@@ -205,10 +205,12 @@ class MartingaleManager:
                 if position_amt >= 0 or entry_price <= 0:
                     continue
                 
-                # Calculate margin and estimate step based on quantity
+                # Get margin from Binance (prefer initialMargin, fallback to calculation)
                 quantity = abs(position_amt)
-                notional = quantity * entry_price
-                margin = notional / 10  # Assuming 10x leverage
+                margin = float(pos.get('initialMargin', 0)) or float(pos.get('isolatedMargin', 0))
+                if margin == 0:
+                    notional = quantity * entry_price
+                    margin = notional / 10  # Fallback to calculation
                 
                 # Estimate step based on margin
                 step = self._estimate_step_from_margin(margin)
@@ -508,6 +510,7 @@ class MartingaleManager:
         if not position:
             return {'should_close': False}
         
+        # Only half-close Step 3+. Step 1-2 too small.
         if position.step < 3:
             return {'should_close': False, 'reason': 'Step < 3'}
         
@@ -521,24 +524,29 @@ class MartingaleManager:
         # Calculate actual P&L in USD
         pnl_usd = (position.average_entry - current_price) * position.total_quantity
         
-        # Step 3: Close half with small profit (even $0.50 is enough)
-        if position.step == 3:
-            if pnl_usd >= 0.5:  # Small profit threshold
-                return {
-                    'should_close': True,
-                    'reason': f'Step 3 + Small profit (${pnl_usd:.2f})',
-                    'pnl_usd': pnl_usd
-                }
+        # Dynamic half-close threshold: 50% of TP target
+        # This locks in profit while letting the rest ride
+        step = position.step
+        if step == 3:
+            min_profit = 3.0   # TP is $6, half-close at $3
+        elif step == 4:
+            min_profit = 4.0   # TP is $8, half-close at $4
+        elif step == 5:
+            min_profit = 5.0   # TP is $10, half-close at $5
+        elif step <= 7:
+            min_profit = 6.0   # TP is $12, half-close at $6
+        else:  # step 8+
+            min_profit = 10.0  # TP is $20, half-close at $10
         
-        # Step 4+: Close half when price returns near average
-        if distance_to_avg <= self.half_close_threshold and distance_to_avg > -10:
+        # Half-close when profit reaches threshold
+        if pnl_usd >= min_profit:
             return {
                 'should_close': True,
-                'reason': f'Price near average ({distance_to_avg:.1f}%)',
-                'distance': distance_to_avg
+                'reason': f'Step {step} half-close at ${pnl_usd:.2f} (target ${min_profit})',
+                'pnl_usd': pnl_usd
             }
         
-        return {'should_close': False, 'reason': f'Distance {distance_to_avg:.1f}%', 'pnl_usd': pnl_usd}
+        return {'should_close': False, 'reason': f'Profit ${pnl_usd:.2f} < ${min_profit}', 'pnl_usd': pnl_usd}
     
     def close_half(self, symbol: str, current_price: float) -> bool:
         """Close half of the Martingale position"""
@@ -631,6 +639,10 @@ class MartingaleManager:
         - Price has returned closer to average (within 1%)
         - Haven't exceeded MAX_RECYCLES
         """
+        # DISABLED: Recycle was closing positions too early before TP
+        # Let positions reach their full TP targets
+        return {'should_recycle': False, 'reason': 'Recycle disabled - wait for TP'}
+        
         position = self.get_position(symbol)
         if not position:
             return {'should_recycle': False}
@@ -644,13 +656,18 @@ class MartingaleManager:
         # For SHORT: check if price has come down closer to average
         distance_to_avg = ((current_price - position.average_entry) / position.average_entry) * 100
         
-        # Recycle when price returns within 1% of average (small profit zone)
+        # Calculate actual P&L in USD
+        pnl_usd = (position.average_entry - current_price) * position.total_quantity
+        
+        # Recycle when price returns within 1% of average AND in profit
         if distance_to_avg <= 1 and distance_to_avg > -3:
-            return {
-                'should_recycle': True,
-                'reason': f'Price near average ({distance_to_avg:.1f}%), recycling margin',
-                'distance': distance_to_avg
-            }
+            if pnl_usd >= 1.0:  # Must have $1+ profit to recycle!
+                return {
+                    'should_recycle': True,
+                    'reason': f'Price near average ({distance_to_avg:.1f}%) + Profit ${pnl_usd:.2f}',
+                    'distance': distance_to_avg,
+                    'pnl_usd': pnl_usd
+                }
         
         return {'should_recycle': False, 'reason': f'Distance {distance_to_avg:.1f}%'}
     
@@ -793,6 +810,104 @@ class MartingaleManager:
         total_qty = sum(e['quantity'] for e in position.entries)
         
         return total_value / total_qty if total_qty > 0 else 0
+    
+    def sync_positions(self) -> Dict:
+        """
+        Sync internal position tracking with Binance's actual positions
+        
+        This fixes quantity/margin mismatches that can occur from:
+        - Half-closes not updating correctly
+        - Partial fills
+        - Manual interventions
+        - Bot restarts
+        
+        Returns:
+            Dict with sync results (updated, removed, added)
+        """
+        results = {'updated': [], 'removed': [], 'added': [], 'errors': []}
+        
+        try:
+            # Get all open positions from Binance
+            binance_positions = self.client.get_positions()
+            binance_symbols = set()
+            
+            for pos in binance_positions:
+                symbol = pos.get('symbol', '')
+                position_amt = float(pos.get('positionAmt', 0))
+                entry_price = float(pos.get('entryPrice', 0))
+                
+                # Only process SHORT positions (negative positionAmt)
+                if position_amt >= 0 or entry_price <= 0:
+                    continue
+                
+                binance_symbols.add(symbol)
+                quantity = abs(position_amt)
+                
+                # Use Binance's actual margin (prefer initialMargin, fallback to isolatedMargin)
+                margin = float(pos.get('initialMargin', 0)) or float(pos.get('isolatedMargin', 0))
+                if margin == 0:
+                    # Fallback: calculate from notional
+                    notional = quantity * entry_price
+                    margin = notional / 10
+                
+                if symbol in self.positions:
+                    # Update existing position
+                    local_pos = self.positions[symbol]
+                    old_qty = local_pos.total_quantity
+                    old_margin = local_pos.total_margin
+                    
+                    # Check for significant differences
+                    qty_diff = abs(local_pos.total_quantity - quantity)
+                    if qty_diff > 0.001 * quantity:  # More than 0.1% difference
+                        local_pos.total_quantity = quantity
+                        local_pos.total_margin = margin
+                        local_pos.average_entry = entry_price
+                        results['updated'].append({
+                            'symbol': symbol,
+                            'old_qty': old_qty,
+                            'new_qty': quantity,
+                            'old_margin': old_margin,
+                            'new_margin': margin
+                        })
+                        logger.info(f"🔄 Synced {symbol}: Qty {old_qty:.4f}→{quantity:.4f}, Margin ${old_margin:.2f}→${margin:.2f}")
+                else:
+                    # Position exists on Binance but not tracked locally - add it
+                    step = self._estimate_step_from_margin(margin)
+                    new_pos = MartingalePosition(
+                        symbol=symbol,
+                        side='SELL',
+                        entries=[{
+                            'price': entry_price,
+                            'quantity': quantity,
+                            'margin': margin,
+                            'synced': True
+                        }],
+                        step=step,
+                        total_quantity=quantity,
+                        total_margin=margin,
+                        average_entry=entry_price
+                    )
+                    self.positions[symbol] = new_pos
+                    results['added'].append(symbol)
+                    logger.info(f"➕ Added untracked position: {symbol} (Step {step}, ${margin:.2f})")
+            
+            # Check for positions we track but no longer exist on Binance
+            tracked_symbols = list(self.positions.keys())
+            for symbol in tracked_symbols:
+                if symbol not in binance_symbols:
+                    del self.positions[symbol]
+                    results['removed'].append(symbol)
+                    logger.info(f"➖ Removed closed position: {symbol}")
+            
+            # Log summary
+            if results['updated'] or results['removed'] or results['added']:
+                logger.info(f"🔄 Sync complete: {len(results['updated'])} updated, {len(results['removed'])} removed, {len(results['added'])} added")
+            
+        except Exception as e:
+            logger.error(f"Position sync failed: {e}")
+            results['errors'].append(str(e))
+        
+        return results
     
     def get_status(self) -> Dict:
         """Get status of all Martingale positions"""

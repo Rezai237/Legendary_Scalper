@@ -62,6 +62,7 @@ class LegendaryScalper:
         self.scan_count = 0
         self.last_pump_scan = 0
         self.pump_scan_interval = 90  # Scan for pumps every 90 seconds
+        self.position_sync_interval = 30  # Sync with Binance every 30 cycles (~5 min)
         
         logger.info("✅ Legendary Scalper initialized!")
         self._print_config()
@@ -95,6 +96,9 @@ class LegendaryScalper:
             recovered = self.martingale.recover_positions()
             if recovered > 0:
                 logger.info(f"✅ Recovered {recovered} positions - will continue managing them!")
+            
+            # Sync to ensure internal state matches Binance
+            self.martingale.sync_positions()
             
             # Initial pump scan
             logger.info("🔍 Scanning for pumped coins...")
@@ -161,7 +165,11 @@ class LegendaryScalper:
                     logger.info(f"🎯 Opening SHORT: {symbol} (Pump: +{pump:.1f}%)")
                     self.martingale.open_position(symbol, opp['price'])
         
-        # 3. Log status
+        # 3. Periodic sync with Binance (every N cycles)
+        if self.scan_count % self.position_sync_interval == 0:
+            self.martingale.sync_positions()
+        
+        # 4. Log status
         self.watcher.log_status()
     
     def run(self):
